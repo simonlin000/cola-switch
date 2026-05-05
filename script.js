@@ -3,21 +3,28 @@ const STORAGE_PREFIX = "cola_switch_key_";
 const state = {
   providers: [],
   customColaProviders: [],
+  compatibilityProfiles: [],
   providerId: "",
   variantId: "",
+  profileId: "direct",
   model: "",
   customColaProvider: "openai",
   customBaseUrl: "",
   status: null,
+  backups: [],
   pending: false,
 };
 
 const elements = {
   statusPanel: document.getElementById("status-panel"),
+  rollbackButton: document.getElementById("rollback-button"),
+  backupMeta: document.getElementById("backup-meta"),
   providerGrid: document.getElementById("provider-grid"),
   variantBlock: document.getElementById("variant-block"),
   variantSelect: document.getElementById("variant-select"),
   variantHelp: document.getElementById("variant-help"),
+  profileSelect: document.getElementById("profile-select"),
+  profileHelp: document.getElementById("profile-help"),
   modelInput: document.getElementById("model-input"),
   modelHelp: document.getElementById("model-help"),
   modelSuggestions: document.getElementById("model-suggestions"),
@@ -34,6 +41,15 @@ const elements = {
   resultBanner: document.getElementById("result-banner"),
   providerCardTemplate: document.getElementById("provider-card-template"),
 };
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
 
 function postNativeStatus(type, message) {
   try {
@@ -99,6 +115,10 @@ function getVariant(providerId, variantId) {
   return getProvider(providerId)?.variants.find((item) => item.id === variantId);
 }
 
+function getProfile(profileId) {
+  return state.compatibilityProfiles.find((item) => item.id === profileId);
+}
+
 function isCustomMode() {
   return state.providerId === "custom";
 }
@@ -148,23 +168,56 @@ function renderStatus() {
 
   const provider = getProvider(status.providerId);
   const title = provider?.name || status.providerLabel || status.providerId;
+  const warnings = status.diagnostics?.warnings || [];
+  const notes = status.diagnostics?.notes || [];
+  const warningHtml = warnings.length
+    ? `
+      <div class="diagnostic-group is-warning">
+        <div class="diagnostic-title">风险提示</div>
+        <ul class="diagnostic-list">
+          ${warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+        </ul>
+      </div>
+    `
+    : "";
+  const notesHtml = notes.length
+    ? `
+      <div class="diagnostic-group is-note">
+        <div class="diagnostic-title">切换备注</div>
+        <ul class="diagnostic-list">
+          ${notes.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+        </ul>
+      </div>
+    `
+    : "";
 
   elements.statusPanel.className = "status-panel";
   elements.statusPanel.innerHTML = `
     <div class="status-main">
       <div class="status-title">
-        <span class="status-provider">${title}</span>
-        <span class="status-model">${status.model}</span>
+        <span class="status-provider">${escapeHtml(title)}</span>
+        <span class="status-model">${escapeHtml(status.model)}</span>
       </div>
       <div class="status-meta">
-        入口：${status.variantLabel || "未识别"}<br>
-        Cola provider：${status.colaProvider}<br>
-        Base URL：${status.baseUrl || "未设置"}<br>
-        已保存 Key：${maskKey(status.apiKey)}<br>
-        配置文件：${status.settingsFile}
+        入口：${escapeHtml(status.variantLabel || "未识别")}<br>
+        接入模式：${escapeHtml(status.profileLabel || "原生直连")}<br>
+        Cola provider：${escapeHtml(status.colaProvider)}<br>
+        Base URL：${escapeHtml(status.baseUrl || "未设置")}<br>
+        已保存 Key：${escapeHtml(maskKey(status.apiKey))}<br>
+        配置文件：${escapeHtml(status.settingsFile)}
       </div>
     </div>
+    ${warningHtml}
+    ${notesHtml}
   `;
+}
+
+function renderBackupStatus() {
+  const latest = state.backups[0];
+  elements.rollbackButton.disabled = state.pending || !latest;
+  elements.backupMeta.textContent = latest
+    ? `最近备份：${latest.fileName}`
+    : "还没有可回滚的备份。";
 }
 
 function renderProviderCards() {
@@ -192,6 +245,7 @@ function renderProviderCards() {
       if (provider.custom && !state.customBaseUrl) {
         state.customBaseUrl = "";
       }
+      state.profileId = provider.custom ? (state.profileId || "openai-compatible") : "direct";
       loadSavedKey();
       render();
       clearBanner();
@@ -217,6 +271,19 @@ function renderCustomProviderOptions() {
   });
 }
 
+function renderProfileOptions() {
+  elements.profileSelect.innerHTML = "";
+  state.compatibilityProfiles.forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.label;
+    if (profile.id === state.profileId) {
+      option.selected = true;
+    }
+    elements.profileSelect.appendChild(option);
+  });
+}
+
 function renderVariantOptions() {
   const provider = getProvider(state.providerId);
   if (!provider) {
@@ -229,15 +296,29 @@ function renderVariantOptions() {
     if (elements.advancedPanel) {
       elements.advancedPanel.open = true;
     }
+    renderProfileOptions();
     renderCustomProviderOptions();
+    elements.profileSelect.value = state.profileId;
+    const profile = getProfile(state.profileId);
+    if (profile?.lockedColaProvider) {
+      state.customColaProvider = profile.lockedColaProvider;
+    }
+    if (profile?.lockedBaseUrl) {
+      state.customBaseUrl = profile.lockedBaseUrl;
+    }
     elements.customProviderSelect.value = state.customColaProvider;
     elements.customBaseUrlInput.value = state.customBaseUrl;
+    elements.profileHelp.textContent = profile?.description || "";
+    elements.customProviderSelect.disabled = Boolean(profile?.lockedColaProvider);
+    elements.customBaseUrlInput.disabled = Boolean(profile?.lockedBaseUrl);
     elements.variantHelp.textContent = "";
     return;
   }
 
   elements.variantBlock.classList.remove("is-hidden");
   elements.customFields.hidden = true;
+  elements.customProviderSelect.disabled = false;
+  elements.customBaseUrlInput.disabled = false;
   elements.variantSelect.innerHTML = "";
 
   provider.variants.forEach((variant) => {
@@ -284,7 +365,8 @@ function renderProviderHint() {
   }
 
   if (provider.custom) {
-    elements.providerHint.textContent = `${provider.keyHint} 你可以把列表外的兼容接口接到这里。`;
+    const profile = getProfile(state.profileId);
+    elements.providerHint.textContent = `${provider.keyHint} 当前会按 ${profile?.label || "自定义模式"} 写入。`;
     return;
   }
 
@@ -300,9 +382,10 @@ function renderActionSummary() {
   }
 
   if (provider.custom) {
+    const profile = getProfile(state.profileId);
     const baseUrl = state.customBaseUrl || "未填写 Base URL";
     const model = state.model || "未填写模型";
-    const summary = `目标：自定义 / ${state.customColaProvider} / ${model} / ${baseUrl}`;
+    const summary = `目标：${profile?.label || "自定义"} / ${state.customColaProvider} / ${model} / ${baseUrl}`;
     elements.actionSummary.textContent = summary;
     return;
   }
@@ -325,6 +408,7 @@ function syncCurrentSelectionWithStatus() {
   if (!match) {
     state.providerId = "custom";
     state.variantId = "manual";
+    state.profileId = state.status.profileId || "openai-compatible";
     state.model = state.status.model || "";
     state.customColaProvider = state.status.colaProvider || "openai";
     state.customBaseUrl = state.status.baseUrl || "";
@@ -332,6 +416,7 @@ function syncCurrentSelectionWithStatus() {
   }
 
   state.providerId = match.id;
+  state.profileId = state.status.profileId || "direct";
   const variant = match.variants.find((item) => item.colaProvider === state.status.colaProvider) || match.variants[0];
   state.variantId = variant.id;
   state.model = state.status.model || match.defaultModel;
@@ -339,6 +424,7 @@ function syncCurrentSelectionWithStatus() {
 
 function render() {
   renderStatus();
+  renderBackupStatus();
   renderProviderCards();
   renderVariantOptions();
   renderModelField();
@@ -351,14 +437,17 @@ function render() {
 }
 
 async function loadInitialData() {
-  const [providersPayload, statusPayload] = await Promise.all([
+  const [providersPayload, statusPayload, backupsPayload] = await Promise.all([
     request("/api/providers"),
     request("/api/status"),
+    request("/api/backups"),
   ]);
 
   state.providers = providersPayload.providers;
   state.customColaProviders = providersPayload.customColaProviders || [];
+  state.compatibilityProfiles = providersPayload.compatibilityProfiles || [];
   state.status = statusPayload.status;
+  state.backups = backupsPayload.backups || [];
   syncCurrentSelectionWithStatus();
   loadSavedKey();
   render();
@@ -381,6 +470,23 @@ elements.modelInput.addEventListener("input", () => {
 
 elements.customProviderSelect.addEventListener("change", () => {
   state.customColaProvider = elements.customProviderSelect.value;
+  loadSavedKey();
+  render();
+  clearBanner();
+});
+
+elements.profileSelect.addEventListener("change", () => {
+  state.profileId = elements.profileSelect.value;
+  const profile = getProfile(state.profileId);
+  if (profile?.defaultCustomColaProvider) {
+    state.customColaProvider = profile.defaultCustomColaProvider;
+  }
+  if (profile?.defaultModel && !state.model) {
+    state.model = profile.defaultModel;
+  }
+  if (profile?.lockedBaseUrl) {
+    state.customBaseUrl = profile.lockedBaseUrl;
+  }
   loadSavedKey();
   render();
   clearBanner();
@@ -413,6 +519,7 @@ elements.switchForm.addEventListener("submit", async (event) => {
     const payload = {
       providerId: state.providerId,
       variantId: state.variantId,
+      profileId: state.profileId,
       model: state.model.trim(),
       apiKey,
       customColaProvider: state.customColaProvider,
@@ -432,18 +539,65 @@ elements.switchForm.addEventListener("submit", async (event) => {
     }
 
     state.status = response.status;
-    renderStatus();
+    if (response.backup) {
+      state.backups = [response.backup, ...state.backups.filter((item) => item.fileName !== response.backup.fileName)].slice(0, 12);
+    }
+    render();
+    const warningSuffix = response.status.diagnostics?.warnings?.length
+      ? ` 但我检测到 ${response.status.diagnostics.warnings.length} 条风险提示，建议先看一眼。`
+      : "";
     const message = response.changed
       ? `已切换到 ${response.status.providerLabel} / ${response.status.model}。下一条新消息通常就会走新配置。`
       : `当前已经是 ${response.status.providerLabel} / ${response.status.model}，我刚刚替你重新保存并验证了一次。`;
-    showBanner(message, "success");
-    window.alert(message);
-    postNativeStatus("success", message);
+    const finalMessage = `${message}${warningSuffix}`;
+    showBanner(finalMessage, response.status.diagnostics?.warnings?.length ? "warn" : "success");
+    window.alert(finalMessage);
+    postNativeStatus("success", finalMessage);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     showBanner(message, "error");
     window.alert(`切换失败：${message}`);
     postNativeStatus("error", `切换失败：${message}`);
+  } finally {
+    state.pending = false;
+    render();
+  }
+});
+
+elements.rollbackButton.addEventListener("click", async () => {
+  const latest = state.backups[0];
+  if (!latest) {
+    showBanner("还没有可回滚的备份。", "warn");
+    return;
+  }
+
+  clearBanner();
+  state.pending = true;
+  render();
+
+  try {
+    const response = await request("/api/rollback", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ fileName: latest.fileName }),
+    });
+
+    state.status = response.status;
+    state.backups = await request("/api/backups").then((payload) => payload.backups || []);
+    syncCurrentSelectionWithStatus();
+    loadSavedKey();
+    render();
+    const message = `已回滚到备份 ${response.backup.fileName}。`;
+    showBanner(message, "success");
+    window.alert(message);
+    postNativeStatus("success", message);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showBanner(`回滚失败：${message}`, "error");
+    window.alert(`回滚失败：${message}`);
+    postNativeStatus("error", `回滚失败：${message}`);
   } finally {
     state.pending = false;
     render();

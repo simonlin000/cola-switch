@@ -9,10 +9,12 @@ const path = require("path");
 const HOST = process.env.COLA_SWITCH_HOST || "127.0.0.1";
 const PORT = Number(process.env.COLA_SWITCH_PORT || 8765);
 const SETTINGS_FILE = process.env.COLA_SETTINGS_FILE || path.join(os.homedir(), ".cola", "settings.json");
+const BACKUP_DIR = process.env.COLA_SWITCH_BACKUP_DIR || path.join(os.homedir(), ".cola", "cola-switch-backups");
 const CONFIG_PREFIX = "cola.enc.v1:";
 const IV_LENGTH = 12;
 const TAG_LENGTH = 16;
 const FILE_MODE = 0o600;
+const DIR_MODE = 0o700;
 const SERVER_LOG_FILE = "/tmp/cola-switch-server.log";
 
 const STATIC_FILES = {
@@ -42,6 +44,48 @@ const CUSTOM_COLA_PROVIDERS = [
   { id: "opencode", label: "opencode" },
   { id: "opencode-go", label: "opencode-go" },
   { id: "openai-codex", label: "openai-codex" },
+];
+
+const COMPATIBILITY_PROFILES = [
+  {
+    id: "direct",
+    label: "原生直连",
+    description: "适合 Cola 已内置的官方服务商，按 provider / variant 原样写入。",
+    defaultCustomColaProvider: "openai",
+  },
+  {
+    id: "openai-compatible",
+    label: "OpenAI Compatible",
+    description: "第三方 OpenAI 兼容接口，自动规整 `/chat/completions`、`/responses` 之类尾路径。",
+    defaultCustomColaProvider: "openai",
+  },
+  {
+    id: "official-model-alias",
+    label: "官方模型别名",
+    description: "第三方 OpenAI 兼容接口，但模型名按官方写法填写，例如 `gpt-5.4` / `claude-opus-4-6`。",
+    defaultCustomColaProvider: "openai",
+  },
+  {
+    id: "anthropic-compatible",
+    label: "Anthropic Messages",
+    description: "第三方 Anthropic `/messages` 兼容接口，适合 Claude 风格网关。",
+    defaultCustomColaProvider: "anthropic",
+  },
+  {
+    id: "minimax-anthropic",
+    label: "MiniMax Anthropic",
+    description: "适合 MiniMax 的 Anthropic 兼容入口，优先写成 `minimax-cn`。",
+    defaultCustomColaProvider: "minimax-cn",
+  },
+  {
+    id: "mimo-token-plan",
+    label: "MiMo Token Plan",
+    description: "小米 MiMo Token Plan 官方接法，默认走 OpenAI-compatible 模式。",
+    defaultCustomColaProvider: "openai",
+    lockedColaProvider: "openai",
+    lockedBaseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+    defaultModel: "mimo-v2.5-pro",
+  },
 ];
 
 const PROVIDERS = [
@@ -352,6 +396,10 @@ async function readSettings() {
   return JSON.parse(decryptSettings(raw));
 }
 
+async function readSettingsRaw() {
+  return fsp.readFile(SETTINGS_FILE, "utf8");
+}
+
 async function writeSettings(settings) {
   await fsp.mkdir(path.dirname(SETTINGS_FILE), { recursive: true });
   const payload = encryptSettings(JSON.stringify(settings, null, 2));
@@ -366,6 +414,84 @@ async function writeSettings(settings) {
   await fsp.chmod(SETTINGS_FILE, FILE_MODE);
 }
 
+function formatBackupTimestamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    "-",
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join("");
+}
+
+function sanitizeBackupLabel(value) {
+  return String(value || "manual")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "manual";
+}
+
+async function ensureBackupDir() {
+  await fsp.mkdir(BACKUP_DIR, { recursive: true, mode: DIR_MODE });
+  await fsp.chmod(BACKUP_DIR, DIR_MODE).catch(() => {});
+}
+
+async function createSettingsBackup(label = "manual") {
+  const raw = await readSettingsRaw();
+  await ensureBackupDir();
+  const fileName = `settings.${formatBackupTimestamp()}.${sanitizeBackupLabel(label)}.bak`;
+  const backupPath = path.join(BACKUP_DIR, fileName);
+  await fsp.writeFile(backupPath, raw, { encoding: "utf8", mode: FILE_MODE });
+  await fsp.chmod(backupPath, FILE_MODE);
+  return {
+    fileName,
+    path: backupPath,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+async function listBackups(limit = 12) {
+  try {
+    await ensureBackupDir();
+    const entries = await fsp.readdir(BACKUP_DIR, { withFileTypes: true });
+    const backups = await Promise.all(entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".bak"))
+      .map(async (entry) => {
+        const backupPath = path.join(BACKUP_DIR, entry.name);
+        const stat = await fsp.stat(backupPath);
+        return {
+          fileName: entry.name,
+          path: backupPath,
+          sizeBytes: stat.size,
+          createdAt: stat.mtime.toISOString(),
+        };
+      }));
+
+    return backups
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+async function restoreBackup(fileName) {
+  const backups = await listBackups(100);
+  const target = backups.find((item) => item.fileName === fileName) || backups[0];
+  if (!target) {
+    throw new Error("还没有可回滚的备份。");
+  }
+
+  const payload = await fsp.readFile(target.path, "utf8");
+  await fsp.writeFile(SETTINGS_FILE, payload, { encoding: "utf8", mode: FILE_MODE });
+  await fsp.chmod(SETTINGS_FILE, FILE_MODE);
+  return target;
+}
+
 function findProvider(providerId) {
   return PROVIDERS.find((item) => item.id === providerId);
 }
@@ -374,7 +500,160 @@ function findVariant(providerId, variantId) {
   return findProvider(providerId)?.variants.find((item) => item.id === variantId);
 }
 
+function findCompatibilityProfile(profileId) {
+  return COMPATIBILITY_PROFILES.find((item) => item.id === profileId);
+}
+
+function trimTrailingSlash(value) {
+  return value.endsWith("/") ? value.replace(/\/+$/, "") : value;
+}
+
+function isAnthropicLikeProvider(providerId, baseUrl) {
+  return providerId === "anthropic" || /\/anthropic$/i.test(baseUrl || "");
+}
+
+function inferProtocol(providerId, baseUrl) {
+  if (providerId === "kimi-coding" || providerId === "zai") {
+    return "coding";
+  }
+
+  return isAnthropicLikeProvider(providerId, baseUrl)
+    ? "anthropic-compatible"
+    : "openai-compatible";
+}
+
+function analyzeConfiguration({ provider, model, baseUrl, apiKey }) {
+  const warnings = [];
+  const notes = [];
+  const protocol = inferProtocol(provider, baseUrl);
+  const lowerModel = String(model || "").toLowerCase();
+  const lowerBaseUrl = String(baseUrl || "").toLowerCase();
+  const lowerProvider = String(provider || "").toLowerCase();
+  const lowerKey = String(apiKey || "").toLowerCase();
+
+  notes.push(`当前会按 ${protocol} 方式写入 Cola。`);
+
+  if (provider === "anthropic" && lowerModel && !lowerModel.startsWith("claude-")) {
+    warnings.push("`anthropic` provider 搭配非 Claude 模型，在 Cola 里很容易触发 `Model not found`。");
+  }
+
+  if ((provider === "minimax" || provider === "minimax-cn") && lowerModel && !lowerModel.startsWith("minimax-")) {
+    warnings.push("MiniMax provider 最稳的是 `MiniMax-*` 模型名，当前这个组合有较大概率被 Cola 本地路由拦掉。");
+  }
+
+  if (lowerModel.startsWith("minimax-") && provider !== "minimax" && provider !== "minimax-cn") {
+    warnings.push("你填的是 MiniMax 模型，但当前 provider 不是 MiniMax，Cola 这类组合通常不稳定。");
+  }
+
+  if (provider === "openai" && /\/anthropic$/i.test(baseUrl || "")) {
+    warnings.push("当前是 `openai` provider，但 Base URL 看起来是 Anthropic 风格入口，这类组合很容易协议错位。");
+  }
+
+  if (provider === "anthropic" && /\/v1$/i.test(baseUrl || "")) {
+    notes.push("Anthropic 风格第三方入口通常只需要根地址，真正请求会走 `/messages`。");
+  }
+
+  if (lowerBaseUrl.includes("token-plan-cn.xiaomimimo.com") && provider !== "openai") {
+    warnings.push("Xiaomi MiMo Token Plan 最稳的是 `openai` provider + `mimo-v2.5-pro` 这类组合。");
+  }
+
+  if (lowerKey.startsWith("tp-") && !lowerBaseUrl.includes("xiaomimimo.com")) {
+    warnings.push("`tp-` 这类 key 通常不是普通 OpenAI/Anthropic key，当前入口和 key 前缀看起来不匹配。");
+  }
+
+  if (lowerBaseUrl.includes("m1.92k.store")) {
+    notes.push("`m1.92k.store` 这类 third-party new API 之前出现过协议和证书链波动，切完后最好立刻做一次真实对话验证。");
+  }
+
+  if (provider === "openai" && lowerModel.startsWith("claude-")) {
+    notes.push("OpenAI-compatible 网关也可能转发 Claude，这种组合不一定错，但更依赖网关兼容性。");
+  }
+
+  return {
+    protocol,
+    warnings,
+    notes,
+  };
+}
+
+function inferCompatibilityProfile({ provider, baseUrl }) {
+  const normalizedBaseUrl = trimTrailingSlash(baseUrl || "");
+  const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
+
+  if (lowerBaseUrl.includes("token-plan-cn.xiaomimimo.com")) {
+    return "mimo-token-plan";
+  }
+
+  if (provider === "minimax" || provider === "minimax-cn") {
+    return "minimax-anthropic";
+  }
+
+  if (provider === "anthropic" && normalizedBaseUrl !== "https://api.anthropic.com") {
+    return "anthropic-compatible";
+  }
+
+  if (provider === "openai" && normalizedBaseUrl !== "https://api.openai.com/v1") {
+    return "openai-compatible";
+  }
+
+  return "direct";
+}
+
+function buildCompatibilityStatus({ provider, model, baseUrl, apiKey }) {
+  const profileId = inferCompatibilityProfile({ provider, baseUrl });
+  const profile = findCompatibilityProfile(profileId) || findCompatibilityProfile("direct");
+  return {
+    profileId,
+    profileLabel: profile.label,
+    diagnostics: analyzeConfiguration({ provider, model, baseUrl, apiKey }),
+  };
+}
+
+function normalizeCustomBaseUrl(value) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) {
+    return "";
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return trimTrailingSlash(raw);
+  }
+
+  const endpointSuffixes = [
+    "/chat/completions",
+    "/completions",
+    "/responses",
+    "/messages",
+    "/message",
+    "/rerank",
+    "/embeddings",
+  ];
+
+  let pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+  for (const suffix of endpointSuffixes) {
+    if (pathname.toLowerCase().endsWith(suffix)) {
+      pathname = pathname.slice(0, -suffix.length) || "/";
+      break;
+    }
+  }
+
+  parsed.pathname = pathname === "/" ? "" : pathname;
+  parsed.search = "";
+  parsed.hash = "";
+  return trimTrailingSlash(parsed.toString());
+}
+
 function buildCustomStatus(settings, activeProvider, activeKey) {
+  const compatibility = buildCompatibilityStatus({
+    provider: activeProvider,
+    model: settings.model || "",
+    baseUrl: activeKey?.baseUrl || "",
+    apiKey: activeKey?.apiKey || "",
+  });
+
   return {
     providerId: "custom",
     providerLabel: `自定义 / ${activeProvider}`,
@@ -385,20 +664,34 @@ function buildCustomStatus(settings, activeProvider, activeKey) {
     apiKey: activeKey?.apiKey || "",
     baseUrl: activeKey?.baseUrl || "",
     settingsFile: SETTINGS_FILE,
+    profileId: compatibility.profileId,
+    profileLabel: compatibility.profileLabel,
+    diagnostics: compatibility.diagnostics,
   };
 }
 
 function resolveUiStatus(settings) {
   const activeProvider = settings.provider;
+  const activeKey = settings.providerKeys?.[activeProvider];
+  const activeBaseUrl = trimTrailingSlash(activeKey?.baseUrl || "");
   const matchedProvider = PROVIDERS.find((provider) =>
-    provider.id !== "custom" && provider.variants.some((variant) => variant.colaProvider === activeProvider),
+    provider.id !== "custom" && provider.variants.some((variant) =>
+      variant.colaProvider === activeProvider &&
+      trimTrailingSlash(variant.baseUrl || "") === activeBaseUrl,
+    ),
   );
   const matchedVariant = matchedProvider?.variants.find((variant) => variant.colaProvider === activeProvider);
-  const activeKey = settings.providerKeys?.[activeProvider];
 
   if (!matchedProvider) {
     return buildCustomStatus(settings, activeProvider, activeKey);
   }
+
+  const compatibility = buildCompatibilityStatus({
+    provider: activeProvider,
+    model: settings.model || "",
+    baseUrl: activeKey?.baseUrl || "",
+    apiKey: activeKey?.apiKey || "",
+  });
 
   return {
     providerId: matchedProvider.id,
@@ -410,7 +703,33 @@ function resolveUiStatus(settings) {
     apiKey: activeKey?.apiKey || "",
     baseUrl: activeKey?.baseUrl || "",
     settingsFile: SETTINGS_FILE,
+    profileId: compatibility.profileId,
+    profileLabel: compatibility.profileLabel,
+    diagnostics: compatibility.diagnostics,
   };
+}
+
+function validateWriteResult(settings, verifiedSettings) {
+  const verifiedProvider = verifiedSettings.provider || "";
+  const verifiedModel = verifiedSettings.model || "";
+  const verifiedKey = verifiedSettings.providerKeys?.[verifiedProvider] || {};
+  const expectedKey = settings.providerKeys?.[settings.provider] || {};
+
+  if (verifiedProvider !== settings.provider) {
+    throw new Error(`写入后 provider 不一致：期望 ${settings.provider}，实际 ${verifiedProvider || "空"}。`);
+  }
+
+  if (verifiedModel !== settings.model) {
+    throw new Error(`写入后 model 不一致：期望 ${settings.model}，实际 ${verifiedModel || "空"}。`);
+  }
+
+  if ((verifiedKey.baseUrl || "") !== (expectedKey.baseUrl || "")) {
+    throw new Error("写入后 Base URL 没有按预期保存。");
+  }
+
+  if ((verifiedKey.apiKey || "") !== (expectedKey.apiKey || "")) {
+    throw new Error("写入后 API Key 没有按预期保存。");
+  }
 }
 
 function sendJson(response, statusCode, payload) {
@@ -436,6 +755,58 @@ function isCustomProviderSupported(colaProvider) {
   return CUSTOM_COLA_PROVIDERS.some((item) => item.id === colaProvider);
 }
 
+function resolveCustomProfileInput(body) {
+  const profile = findCompatibilityProfile(
+    typeof body.profileId === "string" ? body.profileId.trim() : "",
+  ) || findCompatibilityProfile("openai-compatible");
+
+  const rawBaseUrl = typeof body.customBaseUrl === "string" ? body.customBaseUrl.trim() : "";
+  const customProvider = typeof body.customColaProvider === "string" ? body.customColaProvider.trim() : "";
+  const rawModel = typeof body.model === "string" ? body.model.trim() : "";
+
+  let colaProvider = profile.lockedColaProvider || customProvider || profile.defaultCustomColaProvider || "openai";
+  let baseUrl = normalizeCustomBaseUrl(rawBaseUrl);
+  let model = rawModel || profile.defaultModel || "";
+  const notes = [];
+
+  if (profile.id === "mimo-token-plan") {
+    colaProvider = profile.lockedColaProvider || "openai";
+    baseUrl = profile.lockedBaseUrl;
+    if (!rawModel && model) {
+      notes.push(`已按 ${profile.label} 自动补默认模型 ${model}。`);
+    }
+  }
+
+  if (profile.id === "anthropic-compatible" && !customProvider) {
+    colaProvider = "anthropic";
+  }
+
+  if (profile.id === "minimax-anthropic" && !customProvider) {
+    colaProvider = "minimax-cn";
+  }
+
+  if (profile.id === "official-model-alias") {
+    notes.push("当前模板假设你会直接填官方模型名，适合某些 third-party OpenAI 兼容网关。");
+  }
+
+  if (customProvider && colaProvider !== customProvider) {
+    notes.push(`已按 ${profile.label} 改写 Cola provider 为 ${colaProvider}。`);
+  }
+
+  if (!rawBaseUrl && profile.lockedBaseUrl) {
+    notes.push(`已按 ${profile.label} 自动补官方 Base URL。`);
+  }
+
+  return {
+    profile,
+    colaProvider,
+    baseUrl,
+    model,
+    notes,
+    rawBaseUrl,
+  };
+}
+
 async function handleApply(request, response) {
   const body = await readJsonBody(request);
   await appendServerLog(`POST /api/apply providerId=${body.providerId || ""} variantId=${body.variantId || ""} model=${body.model || ""}`);
@@ -446,14 +817,31 @@ async function handleApply(request, response) {
   }
 
   const settings = await readSettings();
+  const backup = await createSettingsBackup("before-switch");
   const previousProvider = settings.provider || "";
   const previousModel = settings.model || "";
   let colaProvider = "";
   let baseUrl = "";
+  let model = "";
+  let normalizationNote = "";
+  let profileNotes = [];
+  let appliedProfileId = "direct";
+  let appliedProfileLabel = findCompatibilityProfile("direct")?.label || "原生直连";
 
   if (provider.custom) {
-    colaProvider = typeof body.customColaProvider === "string" ? body.customColaProvider.trim() : "";
-    baseUrl = typeof body.customBaseUrl === "string" ? body.customBaseUrl.trim() : "";
+    const profileInput = resolveCustomProfileInput(body);
+    colaProvider = profileInput.colaProvider;
+    baseUrl = profileInput.baseUrl;
+    model = profileInput.model;
+    profileNotes = profileInput.notes;
+    appliedProfileId = profileInput.profile.id;
+    appliedProfileLabel = profileInput.profile.label;
+    const rawBaseUrl = profileInput.rawBaseUrl;
+    if (rawBaseUrl && baseUrl && trimTrailingSlash(rawBaseUrl) !== baseUrl) {
+      normalizationNote = profileInput.profile.lockedBaseUrl
+        ? `已按 ${profileInput.profile.label} 覆盖 Base URL 为 ${baseUrl}`
+        : `已把 Base URL 规整成 ${baseUrl}`;
+    }
 
     if (!colaProvider || !isCustomProviderSupported(colaProvider)) {
       sendJson(response, 400, { error: "请先选择一个 Cola provider。" });
@@ -473,9 +861,9 @@ async function handleApply(request, response) {
 
     colaProvider = variant.colaProvider;
     baseUrl = variant.baseUrl;
+    model = typeof body.model === "string" ? body.model.trim() : "";
   }
 
-  const model = typeof body.model === "string" ? body.model.trim() : "";
   if (!model) {
     sendJson(response, 400, { error: "模型不能为空。" });
     return;
@@ -514,10 +902,34 @@ async function handleApply(request, response) {
   );
 
   await writeSettings(settings);
+  const verifiedSettings = await readSettings();
+  validateWriteResult(settings, verifiedSettings);
+  const status = resolveUiStatus(verifiedSettings);
+  status.profileId = appliedProfileId;
+  status.profileLabel = appliedProfileLabel;
+  if (normalizationNote) {
+    status.diagnostics.notes.unshift(normalizationNote);
+  }
+  if (profileNotes.length > 0) {
+    status.diagnostics.notes.unshift(...profileNotes);
+  }
   await appendServerLog(`apply done colaProvider=${colaProvider} model=${model} changed=${changed}`);
   sendJson(response, 200, {
     ok: true,
     changed,
+    backup,
+    status,
+  });
+}
+
+async function handleRollback(request, response) {
+  const body = await readJsonBody(request);
+  const backup = await restoreBackup(typeof body.fileName === "string" ? body.fileName : "");
+  const settings = await readSettings();
+  await appendServerLog(`rollback done fileName=${backup.fileName}`);
+  sendJson(response, 200, {
+    ok: true,
+    backup,
     status: resolveUiStatus(settings),
   });
 }
@@ -531,6 +943,7 @@ async function handleRequest(request, response) {
       sendJson(response, 200, {
         providers: PROVIDERS,
         customColaProviders: CUSTOM_COLA_PROVIDERS,
+        compatibilityProfiles: COMPATIBILITY_PROFILES,
       });
       return;
     }
@@ -541,8 +954,18 @@ async function handleRequest(request, response) {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/api/backups") {
+      sendJson(response, 200, { backups: await listBackups() });
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/api/apply") {
       await handleApply(request, response);
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/rollback") {
+      await handleRollback(request, response);
       return;
     }
 

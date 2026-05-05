@@ -40,6 +40,10 @@
           <h2>当前 Cola 配置</h2>
         </div>
         <div id="status-panel" class="status-panel is-loading">正在读取本地配置...</div>
+        <div class="status-actions">
+          <button id="rollback-button" class="secondary-button" type="button">回滚到上一次切换前</button>
+          <span id="backup-meta" class="status-action-meta">还没有读取到备份。</span>
+        </div>
       </section>
 
       <section class="card switch-card">
@@ -93,6 +97,12 @@
               </label>
 
               <div id="custom-fields" class="custom-fields field-block-wide" hidden>
+                <label class="field-block">
+                  <span class="field-label" for="profile-select">接入模式</span>
+                  <select id="profile-select" class="field-input"></select>
+                  <span id="profile-help" class="field-help"></span>
+                </label>
+
                 <label class="field-block">
                   <span class="field-label" for="custom-provider-select">Cola Provider</span>
                   <select id="custom-provider-select" class="field-input"></select>
