@@ -680,7 +680,10 @@ function resolveUiStatus(settings) {
       trimTrailingSlash(variant.baseUrl || "") === activeBaseUrl,
     ),
   );
-  const matchedVariant = matchedProvider?.variants.find((variant) => variant.colaProvider === activeProvider);
+  const matchedVariant = matchedProvider?.variants.find((variant) =>
+    variant.colaProvider === activeProvider &&
+    trimTrailingSlash(variant.baseUrl || "") === activeBaseUrl,
+  );
 
   if (!matchedProvider) {
     return buildCustomStatus(settings, activeProvider, activeKey);
@@ -807,19 +810,12 @@ function resolveCustomProfileInput(body) {
   };
 }
 
-async function handleApply(request, response) {
-  const body = await readJsonBody(request);
-  await appendServerLog(`POST /api/apply providerId=${body.providerId || ""} variantId=${body.variantId || ""} model=${body.model || ""}`);
+function resolveApplyTarget(body) {
   const provider = findProvider(body.providerId);
   if (!provider) {
-    sendJson(response, 400, { error: "服务商不存在。" });
-    return;
+    throw new Error("服务商不存在。");
   }
 
-  const settings = await readSettings();
-  const backup = await createSettingsBackup("before-switch");
-  const previousProvider = settings.provider || "";
-  const previousModel = settings.model || "";
   let colaProvider = "";
   let baseUrl = "";
   let model = "";
@@ -836,27 +832,24 @@ async function handleApply(request, response) {
     profileNotes = profileInput.notes;
     appliedProfileId = profileInput.profile.id;
     appliedProfileLabel = profileInput.profile.label;
-    const rawBaseUrl = profileInput.rawBaseUrl;
-    if (rawBaseUrl && baseUrl && trimTrailingSlash(rawBaseUrl) !== baseUrl) {
+
+    if (profileInput.rawBaseUrl && baseUrl && trimTrailingSlash(profileInput.rawBaseUrl) !== baseUrl) {
       normalizationNote = profileInput.profile.lockedBaseUrl
         ? `已按 ${profileInput.profile.label} 覆盖 Base URL 为 ${baseUrl}`
         : `已把 Base URL 规整成 ${baseUrl}`;
     }
 
     if (!colaProvider || !isCustomProviderSupported(colaProvider)) {
-      sendJson(response, 400, { error: "请先选择一个 Cola provider。" });
-      return;
+      throw new Error("请先选择一个 Cola provider。");
     }
 
     if (!baseUrl) {
-      sendJson(response, 400, { error: "自定义模式下 Base URL 不能为空。" });
-      return;
+      throw new Error("自定义模式下 Base URL 不能为空。");
     }
   } else {
     const variant = findVariant(body.providerId, body.variantId || provider.defaultVariantId);
     if (!variant) {
-      sendJson(response, 400, { error: "入口配置不存在。" });
-      return;
+      throw new Error("入口配置不存在。");
     }
 
     colaProvider = variant.colaProvider;
@@ -865,12 +858,165 @@ async function handleApply(request, response) {
   }
 
   if (!model) {
-    sendJson(response, 400, { error: "模型不能为空。" });
+    throw new Error("模型不能为空。");
+  }
+
+  return {
+    provider,
+    colaProvider,
+    baseUrl,
+    model,
+    normalizationNote,
+    profileNotes,
+    appliedProfileId,
+    appliedProfileLabel,
+  };
+}
+
+function buildProbeRequest({ colaProvider, baseUrl, model, apiKey }) {
+  const normalizedBaseUrl = trimTrailingSlash(baseUrl || "");
+  const protocol = inferProtocol(colaProvider, normalizedBaseUrl);
+
+  if (protocol === "anthropic-compatible") {
+    return {
+      protocol,
+      url: `${normalizedBaseUrl}/messages`,
+      options: {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 8,
+          messages: [{ role: "user", content: "ping" }],
+        }),
+      },
+    };
+  }
+
+  return {
+    protocol,
+    url: `${normalizedBaseUrl}/chat/completions`,
+    options: {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 8,
+        messages: [{ role: "user", content: "ping" }],
+      }),
+    },
+  };
+}
+
+function createTimeoutSignal(timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: controller.signal,
+    cancel: () => clearTimeout(timer),
+  };
+}
+
+async function probeProvider(target, apiKey) {
+  const probeRequest = buildProbeRequest({
+    colaProvider: target.colaProvider,
+    baseUrl: target.baseUrl,
+    model: target.model,
+    apiKey,
+  });
+  const timeout = createTimeoutSignal(12000);
+
+  try {
+    const response = await fetch(probeRequest.url, {
+      ...probeRequest.options,
+      signal: timeout.signal,
+    });
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {}
+
+    if (!response.ok) {
+      const upstreamMessage =
+        payload?.error?.message ||
+        payload?.message ||
+        text.slice(0, 240) ||
+        `HTTP ${response.status}`;
+      throw new Error(`连通性检测失败：${response.status} ${upstreamMessage}`);
+    }
+
+    return {
+      ok: true,
+      protocol: probeRequest.protocol,
+      statusCode: response.status,
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("连通性检测超时：12 秒内没有收到模型服务响应。");
+    }
+    throw error;
+  } finally {
+    timeout.cancel();
+  }
+}
+
+async function handleProbe(request, response) {
+  const body = await readJsonBody(request);
+  let target;
+  try {
+    target = resolveApplyTarget(body);
+  } catch (error) {
+    sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
     return;
   }
 
+  const settings = await readSettings();
   const nextKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
-  const existingKey = settings.providerKeys?.[colaProvider]?.apiKey || "";
+  const existingKey = settings.providerKeys?.[target.colaProvider]?.apiKey || "";
+  const apiKey = nextKey || existingKey;
+
+  if (!apiKey) {
+    sendJson(response, 400, { error: "这个服务商还没有保存过 key，请先填入 API Key。" });
+    return;
+  }
+
+  const probe = await probeProvider(target, apiKey);
+  sendJson(response, 200, {
+    ok: true,
+    probe,
+    target: {
+      colaProvider: target.colaProvider,
+      model: target.model,
+      baseUrl: target.baseUrl,
+    },
+  });
+}
+
+async function handleApply(request, response) {
+  const body = await readJsonBody(request);
+  await appendServerLog(`POST /api/apply providerId=${body.providerId || ""} variantId=${body.variantId || ""} model=${body.model || ""}`);
+
+  let target;
+  try {
+    target = resolveApplyTarget(body);
+  } catch (error) {
+    sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+
+  const settings = await readSettings();
+  const previousProvider = settings.provider || "";
+  const previousModel = settings.model || "";
+  const nextKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+  const existingKey = settings.providerKeys?.[target.colaProvider]?.apiKey || "";
   const previousBaseUrl = settings.providerKeys?.[previousProvider]?.baseUrl || "";
   const previousApiKey = settings.providerKeys?.[previousProvider]?.apiKey || "";
   const apiKey = nextKey || existingKey;
@@ -880,24 +1026,26 @@ async function handleApply(request, response) {
     return;
   }
 
-  settings.provider = colaProvider;
-  settings.model = model;
+  const backup = await createSettingsBackup("before-switch");
+
+  settings.provider = target.colaProvider;
+  settings.model = target.model;
   settings.modelConfig = {
-    sota: model,
-    default: model,
-    fast: model,
+    sota: target.model,
+    default: target.model,
+    fast: target.model,
   };
   settings.thinkingLevel = settings.thinkingLevel || "off";
   settings.providerKeys = settings.providerKeys || {};
-  settings.providerKeys[colaProvider] = {
+  settings.providerKeys[target.colaProvider] = {
     apiKey,
-    baseUrl,
+    baseUrl: target.baseUrl,
   };
 
   const changed = !(
-    previousProvider === colaProvider &&
-    previousModel === model &&
-    previousBaseUrl === baseUrl &&
+    previousProvider === target.colaProvider &&
+    previousModel === target.model &&
+    previousBaseUrl === target.baseUrl &&
     previousApiKey === apiKey
   );
 
@@ -905,15 +1053,15 @@ async function handleApply(request, response) {
   const verifiedSettings = await readSettings();
   validateWriteResult(settings, verifiedSettings);
   const status = resolveUiStatus(verifiedSettings);
-  status.profileId = appliedProfileId;
-  status.profileLabel = appliedProfileLabel;
-  if (normalizationNote) {
-    status.diagnostics.notes.unshift(normalizationNote);
+  status.profileId = target.appliedProfileId;
+  status.profileLabel = target.appliedProfileLabel;
+  if (target.normalizationNote) {
+    status.diagnostics.notes.unshift(target.normalizationNote);
   }
-  if (profileNotes.length > 0) {
-    status.diagnostics.notes.unshift(...profileNotes);
+  if (target.profileNotes.length > 0) {
+    status.diagnostics.notes.unshift(...target.profileNotes);
   }
-  await appendServerLog(`apply done colaProvider=${colaProvider} model=${model} changed=${changed}`);
+  await appendServerLog(`apply done colaProvider=${target.colaProvider} model=${target.model} changed=${changed}`);
   sendJson(response, 200, {
     ok: true,
     changed,
@@ -959,6 +1107,11 @@ async function handleRequest(request, response) {
       return;
     }
 
+    if (request.method === "POST" && url.pathname === "/api/probe") {
+      await handleProbe(request, response);
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/api/apply") {
       await handleApply(request, response);
       return;
@@ -993,7 +1146,20 @@ const server = http.createServer((request, response) => {
   handleRequest(request, response);
 });
 
-server.listen(PORT, HOST, () => {
-  fsp.writeFile(SERVER_LOG_FILE, "", "utf8").catch(() => {});
-  process.stdout.write(`Cola switch running at http://${HOST}:${PORT}\n`);
-});
+if (process.env.NODE_ENV === "test") {
+  module.exports = {
+    normalizeCustomBaseUrl,
+    resolveCustomProfileInput,
+    analyzeConfiguration,
+    inferCompatibilityProfile,
+    resolveApplyTarget,
+    buildProbeRequest,
+  };
+}
+
+if (process.env.NODE_ENV !== "test") {
+  server.listen(PORT, HOST, () => {
+    fsp.writeFile(SERVER_LOG_FILE, "", "utf8").catch(() => {});
+    process.stdout.write(`Cola switch running at http://${HOST}:${PORT}\n`);
+  });
+}

@@ -526,6 +526,22 @@ elements.switchForm.addEventListener("submit", async (event) => {
       customBaseUrl: state.customBaseUrl.trim(),
     };
 
+    showBanner("正在检测模型服务连通性...", "info");
+
+    const probeResponse = await request("/api/probe", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    postNativeStatus(
+      "progress",
+      `连通性检测通过：${probeResponse.probe.protocol} / HTTP ${probeResponse.probe.statusCode}`,
+    );
+    showBanner("连通性检测通过，正在写入 Cola 配置...", "info");
+
     const response = await request("/api/apply", {
       method: "POST",
       headers: {
@@ -551,7 +567,6 @@ elements.switchForm.addEventListener("submit", async (event) => {
       : `当前已经是 ${response.status.providerLabel} / ${response.status.model}，我刚刚替你重新保存并验证了一次。`;
     const finalMessage = `${message}${warningSuffix}`;
     showBanner(finalMessage, response.status.diagnostics?.warnings?.length ? "warn" : "success");
-    window.alert(finalMessage);
     postNativeStatus("success", finalMessage);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

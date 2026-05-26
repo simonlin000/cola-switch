@@ -485,6 +485,12 @@ button {
   color: #6a490c;
 }
 
+.result-banner.is-info {
+  border-color: rgba(31, 111, 88, 0.16);
+  background: rgba(31, 111, 88, 0.09);
+  color: #184f40;
+}
+
 @media (max-width: 900px) {
   .hero-card {
     flex-direction: column;
